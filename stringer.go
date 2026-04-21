@@ -90,7 +90,11 @@ func maskStruct(v reflect.Value, prefix string, path string) []string {
 		var displayValue string
 
 		if fieldType.Tag.Get(sensitiveTag) == trueVal {
-			displayValue = maskedVal
+			if field.IsZero() {
+				displayValue = emptyVal
+			} else {
+				displayValue = maskedVal
+			}
 		} else {
 			displayValue = formatValue(field)
 		}
