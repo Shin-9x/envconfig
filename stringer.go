@@ -4,6 +4,7 @@ import (
 	"encoding"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 )
 
@@ -45,6 +46,13 @@ func maskStruct(v reflect.Value, prefix string, path string) []string {
 			continue
 		}
 
+		if field.Kind() == reflect.Pointer {
+			if field.IsNil() {
+				continue
+			}
+			field = field.Elem()
+		}
+
 		// Prefix handling
 		fieldPrefix := prefix
 		if p := fieldType.Tag.Get(prefixTag); p != emptyVal {
@@ -56,9 +64,20 @@ func maskStruct(v reflect.Value, prefix string, path string) []string {
 			field.Type() != typeDuration &&
 			field.Type() != typeTime {
 
-			subParts := maskStruct(field, fieldPrefix, joinPath(path, fieldType.Name))
-			parts = append(parts, subParts...)
-			continue
+			isCustomScalar := false
+
+			if field.CanInterface() {
+				_, isCustomScalar = field.Interface().(encoding.TextMarshaler)
+			}
+			if !isCustomScalar && field.CanAddr() {
+				_, isCustomScalar = field.Addr().Interface().(encoding.TextMarshaler)
+			}
+
+			if !isCustomScalar {
+				subParts := maskStruct(field, fieldPrefix, joinPath(path, fieldType.Name))
+				parts = append(parts, subParts...)
+				continue
+			}
 		}
 
 		envKey := fieldType.Tag.Get(envTag)
@@ -92,23 +111,18 @@ func formatValue(v reflect.Value) string {
 
 	// Interface encoding.TextMarshaler control
 	if v.CanInterface() {
-		var tm encoding.TextMarshaler
-
-		// Check the value directly
-		if m, ok := v.Interface().(encoding.TextMarshaler); ok {
-			tm = m
-		} else if v.CanAddr() {
-			// Or the pointer to the value
-			if m, ok := v.Addr().Interface().(encoding.TextMarshaler); ok {
-				tm = m
+		if tm, ok := v.Interface().(encoding.TextMarshaler); ok {
+			if b, err := tm.MarshalText(); err == nil {
+				return string(b)
 			}
 		}
+	}
 
-		if tm != nil {
-			if text, err := tm.MarshalText(); err == nil {
-				return string(text)
+	if v.CanAddr() {
+		if tm, ok := v.Addr().Interface().(encoding.TextMarshaler); ok {
+			if b, err := tm.MarshalText(); err == nil {
+				return string(b)
 			}
-			// If MarshalText fails, we proceed with the standard fallbacks
 		}
 	}
 
@@ -131,14 +145,19 @@ func formatValue(v reflect.Value) string {
 		if v.IsNil() {
 			return "map[]"
 		}
+
+		keys := v.MapKeys()
+
+		sort.Slice(keys, func(i, j int) bool {
+			return fmt.Sprint(keys[i]) < fmt.Sprint(keys[j])
+		})
+
 		var values []string
-		iter := v.MapRange()
-		for iter.Next() {
-			k := formatValue(iter.Key())
-			val := formatValue(iter.Value())
-			// Hardcoding ":" here for representation purposes
-			values = append(values, fmt.Sprintf("%s:%s", k, val))
+		for _, k := range keys {
+			val := v.MapIndex(k)
+			values = append(values, fmt.Sprintf("%s:%s", formatValue(k), formatValue(val)))
 		}
+
 		return "map[" + strings.Join(values, commaAndSpace) + "]"
 
 	default:
