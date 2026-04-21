@@ -22,11 +22,13 @@ const (
 	requiredTag  = "required"
 	sensitiveTag = "sensitive"
 	sepTag       = "sep"
+	prefixTag    = "envPrefix"
 )
 
 // Pre-computed types to avoid repeated reflect.TypeOf calls at runtime
 var (
 	typeDuration = reflect.TypeOf(time.Duration(0))
+	typeTime     = reflect.TypeOf(time.Time{})
 	typeString   = reflect.TypeOf("")
 	typeInt      = reflect.TypeOf(0)
 	typeInt64    = reflect.TypeOf(int64(0))
@@ -37,61 +39,107 @@ var (
 
 func Load[T any]() (T, error) {
 	var cfg T
-	var errs []error
 
 	v := reflect.ValueOf(&cfg).Elem()
-	t := v.Type()
-
-	if t.Kind() != reflect.Struct {
+	if v.Kind() != reflect.Struct {
 		return cfg, fmt.Errorf("config must be a struct")
 	}
 
-	for i := range v.NumField() {
-		field := v.Field(i)
-		fieldType := t.Field(i)
-
-		envKey := fieldType.Tag.Get(envTag)
-		if envKey == emptyVal {
-			continue
-		}
-
-		required := fieldType.Tag.Get(requiredTag) == trueVal
-		defValue := fieldType.Tag.Get(defaultTag)
-		sep := fieldType.Tag.Get(sepTag)
-		if sep == emptyVal {
-			sep = defaultSep
-		}
-
-		rawValue, exists := os.LookupEnv(envKey)
-
-		var value string
-		if exists && rawValue != emptyVal {
-			value = rawValue
-		} else {
-			if required {
-				// Collect the error and continue to the next field.
-				errs = append(errs, fmt.Errorf("missing required env var: %s", envKey))
-				continue
-			}
-			value = defValue
-		}
-
-		if err := setFieldValue(field, value, envKey, sep); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if err := errors.Join(errs...); err != nil {
+	err := processStruct(v, "", "")
+	if err != nil {
 		return cfg, err
 	}
 
 	return cfg, nil
 }
 
-func setFieldValue(field reflect.Value, value string, envKey string, sep string) error {
-	// Handle slice types before everything else.
+// ---------------------- CORE ----------------------
+
+func processStruct(v reflect.Value, prefix string, path string) error {
+	t := v.Type()
+	var errs []error
+
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		fieldType := t.Field(i)
+
+		// Skip unexported
+		if !field.CanSet() {
+			continue
+		}
+
+		// Prefix handling
+		fieldPrefix := prefix
+		if p := fieldType.Tag.Get(prefixTag); p != emptyVal {
+			fieldPrefix += p
+		}
+
+		// Nested struct (excluding special types)
+		if field.Kind() == reflect.Struct && field.Type() != typeDuration && field.Type() != typeTime {
+			newPath := joinPath(path, fieldType.Name)
+			if err := processStruct(field, fieldPrefix, newPath); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+
+		envKey := fieldType.Tag.Get(envTag)
+		if envKey == emptyVal {
+			continue
+		}
+
+		fullEnvKey := fieldPrefix + envKey
+		currentPath := joinPath(path, fieldType.Name)
+
+		required := fieldType.Tag.Get(requiredTag) != emptyVal
+		defValue := fieldType.Tag.Get(defaultTag)
+
+		sep := fieldType.Tag.Get(sepTag)
+		if sep == emptyVal {
+			sep = defaultSep
+		}
+
+		rawValue, exists := os.LookupEnv(fullEnvKey)
+
+		var value string
+		if exists && rawValue != emptyVal {
+			value = strings.TrimSpace(rawValue)
+		} else {
+			if required {
+				errs = append(errs, fmt.Errorf("%s: missing required env var %s", currentPath, fullEnvKey))
+				continue
+			}
+			value = defValue
+		}
+
+		if err := setFieldValue(field, value, currentPath, fullEnvKey, sep); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// ---------------------- VALUE SETTERS ----------------------
+
+func setFieldValue(field reflect.Value, value string, path string, envKey string, sep string) error {
+	// Handle pointer types: allocate, recurse on the pointed-to value, then assign.
+	if field.Kind() == reflect.Pointer {
+		// An empty value leaves a nil pointer (not a pointer to a zero value).
+		if value == emptyVal {
+			return nil
+		}
+		ptr := reflect.New(field.Type().Elem())
+		if err := setFieldValue(ptr.Elem(), value, path, envKey, sep); err != nil {
+			return err
+		}
+		field.Set(ptr)
+		return nil
+	}
+
+	// Slice
 	if field.Kind() == reflect.Slice {
-		return setSliceValue(field, value, envKey, sep)
+		return setSliceValue(field, value, path, envKey, sep)
 	}
 
 	// Skip unset optional scalar fields to avoid parse errors on empty strings.
@@ -105,7 +153,7 @@ func setFieldValue(field reflect.Value, value string, envKey string, sep string)
 	if field.CanAddr() {
 		if u, ok := field.Addr().Interface().(Unmarshaler); ok {
 			if err := u.UnmarshalEnv(value); err != nil {
-				return fmt.Errorf("invalid value for %s: %w", envKey, err)
+				return fmt.Errorf("%s: invalid value for %s: %w", path, envKey, err)
 			}
 			return nil
 		}
@@ -115,9 +163,16 @@ func setFieldValue(field reflect.Value, value string, envKey string, sep string)
 	case typeDuration:
 		parsed, err := time.ParseDuration(value)
 		if err != nil {
-			return fmt.Errorf("invalid duration for %s: %w", envKey, err)
+			return fmt.Errorf("%s: invalid duration for %s: %w", path, envKey, err)
 		}
 		field.SetInt(int64(parsed))
+
+	case typeTime:
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return fmt.Errorf("%s: invalid time for %s (RFC3339): %w", path, envKey, err)
+		}
+		field.Set(reflect.ValueOf(parsed))
 
 	case typeString:
 		field.SetString(value)
@@ -125,46 +180,46 @@ func setFieldValue(field reflect.Value, value string, envKey string, sep string)
 	case typeInt:
 		parsed, err := strconv.Atoi(value)
 		if err != nil {
-			return fmt.Errorf("invalid int for %s: %w", envKey, err)
+			return fmt.Errorf("%s: invalid int for %s: %w", path, envKey, err)
 		}
 		field.SetInt(int64(parsed))
 
 	case typeInt64:
 		parsed, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
-			return fmt.Errorf("invalid int64 for %s: %w", envKey, err)
+			return fmt.Errorf("%s: invalid int64 for %s: %w", path, envKey, err)
 		}
 		field.SetInt(parsed)
 
 	case typeFloat32:
 		parsed, err := strconv.ParseFloat(value, 32)
 		if err != nil {
-			return fmt.Errorf("invalid float32 for %s: %w", envKey, err)
+			return fmt.Errorf("%s: invalid float32 for %s: %w", path, envKey, err)
 		}
 		field.SetFloat(parsed)
 
 	case typeFloat64:
 		parsed, err := strconv.ParseFloat(value, 64)
 		if err != nil {
-			return fmt.Errorf("invalid float64 for %s: %w", envKey, err)
+			return fmt.Errorf("%s: invalid float64 for %s: %w", path, envKey, err)
 		}
 		field.SetFloat(parsed)
 
 	case typeBool:
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
-			return fmt.Errorf("invalid bool for %s: %w", envKey, err)
+			return fmt.Errorf("%s: invalid bool for %s: %w", path, envKey, err)
 		}
 		field.SetBool(parsed)
 
 	default:
-		return fmt.Errorf("unsupported type %s for env %s", field.Type(), envKey)
+		return fmt.Errorf("%s: unsupported type %s for env %s", path, field.Type(), envKey)
 	}
 
 	return nil
 }
 
-func setSliceValue(field reflect.Value, value string, envKey string, sep string) error {
+func setSliceValue(field reflect.Value, value string, path string, envKey string, sep string) error {
 	// An empty value produces a nil slice, not [""]
 	if value == emptyVal {
 		field.Set(reflect.Zero(field.Type()))
@@ -180,7 +235,9 @@ func setSliceValue(field reflect.Value, value string, envKey string, sep string)
 		part = strings.TrimSpace(part)
 		elem := reflect.New(elemType).Elem()
 
-		if err := setFieldValue(elem, part, fmt.Sprintf("%s[%d]", envKey, i), sep); err != nil {
+		elemPath := fmt.Sprintf("%s[%d]", path, i)
+
+		if err := setFieldValue(elem, part, elemPath, envKey, sep); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -194,4 +251,13 @@ func setSliceValue(field reflect.Value, value string, envKey string, sep string)
 
 	field.Set(slice)
 	return nil
+}
+
+// ---------------------- UTILS ----------------------
+
+func joinPath(parent, child string) string {
+	if parent == "" {
+		return child
+	}
+	return parent + "." + child
 }
