@@ -1,6 +1,7 @@
 package envconfig
 
 import (
+	"encoding"
 	"errors"
 	"fmt"
 	"os"
@@ -12,16 +13,18 @@ import (
 
 // Constants
 const (
-	emptyVal   = ""
-	trueVal    = "true"
-	defaultSep = ","
-	maskedVal  = "[*****]"
+	emptyVal     = ""
+	trueVal      = "true"
+	defaultSep   = ","
+	defaultKvSep = ":"
+	maskedVal    = "[*****]"
 
 	envTag       = "env"
 	defaultTag   = "default"
 	requiredTag  = "required"
 	sensitiveTag = "sensitive"
-	sepTag       = "sep"
+	sepTag       = "comma"
+	kvSepTag     = "kvSep"
 	prefixTag    = "envPrefix"
 )
 
@@ -30,11 +33,22 @@ var (
 	typeDuration = reflect.TypeOf(time.Duration(0))
 	typeTime     = reflect.TypeOf(time.Time{})
 	typeString   = reflect.TypeOf("")
-	typeInt      = reflect.TypeOf(0)
-	typeInt64    = reflect.TypeOf(int64(0))
-	typeFloat32  = reflect.TypeOf(float32(0))
-	typeFloat64  = reflect.TypeOf(float64(0))
-	typeBool     = reflect.TypeOf(false)
+
+	// Signed Types
+	typeInt   = reflect.TypeOf(0)
+	typeInt32 = reflect.TypeOf(int32(0)) // valid also for `rune`
+	typeInt64 = reflect.TypeOf(int64(0))
+
+	// Unsigned Types
+	typeUint   = reflect.TypeOf(uint(0))
+	typeUint8  = reflect.TypeOf(uint8(0)) // valid also for `byte`
+	typeUint64 = reflect.TypeOf(uint64(0))
+
+	// Float
+	typeFloat32 = reflect.TypeOf(float32(0))
+	typeFloat64 = reflect.TypeOf(float64(0))
+
+	typeBool = reflect.TypeOf(false)
 )
 
 func Load[T any]() (T, error) {
@@ -99,6 +113,11 @@ func processStruct(v reflect.Value, prefix string, path string) error {
 			sep = defaultSep
 		}
 
+		kvSep := fieldType.Tag.Get(kvSepTag)
+		if kvSep == emptyVal {
+			kvSep = defaultKvSep
+		}
+
 		rawValue, exists := os.LookupEnv(fullEnvKey)
 
 		var value string
@@ -112,7 +131,7 @@ func processStruct(v reflect.Value, prefix string, path string) error {
 			value = defValue
 		}
 
-		if err := setFieldValue(field, value, currentPath, fullEnvKey, sep); err != nil {
+		if err := setFieldValue(field, value, currentPath, fullEnvKey, sep, kvSep); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -122,7 +141,7 @@ func processStruct(v reflect.Value, prefix string, path string) error {
 
 // ---------------------- VALUE SETTERS ----------------------
 
-func setFieldValue(field reflect.Value, value string, path string, envKey string, sep string) error {
+func setFieldValue(field reflect.Value, value string, path string, envKey string, sep string, kvSep string) error {
 	// Handle pointer types: allocate, recurse on the pointed-to value, then assign.
 	if field.Kind() == reflect.Pointer {
 		// An empty value leaves a nil pointer (not a pointer to a zero value).
@@ -130,16 +149,21 @@ func setFieldValue(field reflect.Value, value string, path string, envKey string
 			return nil
 		}
 		ptr := reflect.New(field.Type().Elem())
-		if err := setFieldValue(ptr.Elem(), value, path, envKey, sep); err != nil {
+		if err := setFieldValue(ptr.Elem(), value, path, envKey, sep, kvSep); err != nil {
 			return err
 		}
 		field.Set(ptr)
 		return nil
 	}
 
+	// Map
+	if field.Kind() == reflect.Map {
+		return setMapValue(field, value, path, envKey, sep, kvSep)
+	}
+
 	// Slice
 	if field.Kind() == reflect.Slice {
-		return setSliceValue(field, value, path, envKey, sep)
+		return setSliceValue(field, value, path, envKey, sep, kvSep)
 	}
 
 	// Skip unset optional scalar fields to avoid parse errors on empty strings.
@@ -151,9 +175,19 @@ func setFieldValue(field reflect.Value, value string, path string, envKey string
 	// field.Addr() is safe here because Load() always works on &cfg.Elem(),
 	// which guarantees all fields are addressable.
 	if field.CanAddr() {
+		// Custom envconfig.Unmarshaler interface control
 		if u, ok := field.Addr().Interface().(Unmarshaler); ok {
 			if err := u.UnmarshalEnv(value); err != nil {
 				return fmt.Errorf("%s: invalid value for %s: %w", path, envKey, err)
+			}
+			return nil
+		}
+
+		// Standard encoding.TextUnmarshaler interface control
+		if tu, ok := field.Addr().Interface().(encoding.TextUnmarshaler); ok {
+			// UnmarshalText requires a byte slice
+			if err := tu.UnmarshalText([]byte(value)); err != nil {
+				return fmt.Errorf("%s: invalid text for %s: %w", path, envKey, err)
 			}
 			return nil
 		}
@@ -184,12 +218,41 @@ func setFieldValue(field reflect.Value, value string, path string, envKey string
 		}
 		field.SetInt(int64(parsed))
 
+	case typeInt32: // it works for int32 and alias
+		parsed, err := strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			return fmt.Errorf("%s: invalid int32/rune for %s: %w", path, envKey, err)
+		}
+		field.SetInt(parsed)
+
 	case typeInt64:
 		parsed, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
 			return fmt.Errorf("%s: invalid int64 for %s: %w", path, envKey, err)
 		}
 		field.SetInt(parsed)
+
+	case typeUint:
+		// Passing 0 as bitSize, the parser understands whether the platform uses 32-bit or 64-bit uints.
+		parsed, err := strconv.ParseUint(value, 10, 0)
+		if err != nil {
+			return fmt.Errorf("%s: invalid uint for %s: %w", path, envKey, err)
+		}
+		field.SetUint(parsed)
+
+	case typeUint8: // It works for uint8 e byte
+		parsed, err := strconv.ParseUint(value, 10, 8)
+		if err != nil {
+			return fmt.Errorf("%s: invalid uint8/byte for %s: %w", path, envKey, err)
+		}
+		field.SetUint(parsed)
+
+	case typeUint64:
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s: invalid uint64 for %s: %w", path, envKey, err)
+		}
+		field.SetUint(parsed)
 
 	case typeFloat32:
 		parsed, err := strconv.ParseFloat(value, 32)
@@ -219,7 +282,7 @@ func setFieldValue(field reflect.Value, value string, path string, envKey string
 	return nil
 }
 
-func setSliceValue(field reflect.Value, value string, path string, envKey string, sep string) error {
+func setSliceValue(field reflect.Value, value string, path string, envKey string, sep string, kvSep string) error {
 	// An empty value produces a nil slice, not [""]
 	if value == emptyVal {
 		field.Set(reflect.Zero(field.Type()))
@@ -237,7 +300,7 @@ func setSliceValue(field reflect.Value, value string, path string, envKey string
 
 		elemPath := fmt.Sprintf("%s[%d]", path, i)
 
-		if err := setFieldValue(elem, part, elemPath, envKey, sep); err != nil {
+		if err := setFieldValue(elem, part, elemPath, envKey, sep, kvSep); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -250,6 +313,57 @@ func setSliceValue(field reflect.Value, value string, path string, envKey string
 	}
 
 	field.Set(slice)
+	return nil
+}
+
+func setMapValue(field reflect.Value, value string, path string, envKey string, sep string, kvSep string) error {
+	// An empty value produces an empty map
+	if value == emptyVal {
+		field.Set(reflect.MakeMap(field.Type()))
+		return nil
+	}
+
+	// Enforce string keys for simplicity and common use cases
+	if field.Type().Key().Kind() != reflect.String {
+		return fmt.Errorf("%s: unsupported map key type %s for env %s (only string keys are supported)", path, field.Type().Key(), envKey)
+	}
+
+	parts := strings.Split(value, sep)
+	elemType := field.Type().Elem()
+	m := reflect.MakeMap(field.Type())
+
+	var errs []error
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == emptyVal {
+			continue
+		}
+
+		kv := strings.SplitN(part, kvSep, 2)
+		if len(kv) != 2 {
+			errs = append(errs, fmt.Errorf("%s: malformed map item %q for env %s (expected key%svalue)", path, part, envKey, kvSep))
+			continue
+		}
+
+		mapKey := strings.TrimSpace(kv[0])
+		mapVal := strings.TrimSpace(kv[1])
+
+		elem := reflect.New(elemType).Elem()
+		elemPath := fmt.Sprintf("%s[%s]", path, mapKey)
+
+		if err := setFieldValue(elem, mapVal, elemPath, envKey, sep, kvSep); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		m.SetMapIndex(reflect.ValueOf(mapKey), elem)
+	}
+
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+
+	field.Set(m)
 	return nil
 }
 
