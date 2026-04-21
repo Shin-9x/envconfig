@@ -2,6 +2,7 @@ package envconfig
 
 import (
 	"testing"
+	"time"
 )
 
 // -------------------- BASIC TYPES --------------------
@@ -57,6 +58,21 @@ type nestedCfg struct {
 		Host string `env:"HOST"`
 		Port int    `env:"PORT"`
 	} `envPrefix:"DB_"`
+}
+
+// -------------------- DURATION & MIXED --------------------
+
+type serverCfg struct {
+	// General
+	LogLevel        string        `env:"logLevel"        default:"INFO"`
+	ShutdownTimeout time.Duration `env:"shutdownTimeout" default:"10s"`
+
+	// Server
+	Port         int           `env:"port"          required:"true"`
+	ContextPath  string        `env:"contextPath"   default:"/"`
+	PingTimeout  time.Duration `env:"pingTimeout"   default:"2s"`
+	ReadTimeout  time.Duration `env:"readTimeout"   default:"5s"`
+	WriteTimeout time.Duration `env:"writeTimeout"  default:"5s"`
 }
 
 // -------------------- TESTS --------------------
@@ -167,5 +183,38 @@ func TestLoad_NestedStruct(t *testing.T) {
 	}
 	if cfg.DB.Port != 5432 {
 		t.Errorf("port mismatch")
+	}
+}
+
+func TestLoad_Duration(t *testing.T) {
+	t.Setenv("port", "8080")
+	t.Setenv("pingTimeout", "500ms")
+
+	cfg, err := Load[serverCfg]()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.LogLevel != "INFO" {
+		t.Errorf("LogLevel expected INFO, got %s", cfg.LogLevel)
+	}
+	if cfg.ShutdownTimeout != 10*time.Second {
+		t.Errorf("ShutdownTimeout expected 10s, got %v", cfg.ShutdownTimeout)
+	}
+	if cfg.ContextPath != "/" {
+		t.Errorf("ContextPath expected /, got %s", cfg.ContextPath)
+	}
+	if cfg.ReadTimeout != 5*time.Second {
+		t.Errorf("ReadTimeout expected 5s, got %v", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != 5*time.Second {
+		t.Errorf("WriteTimeout expected 5s, got %v", cfg.WriteTimeout)
+	}
+
+	if cfg.Port != 8080 {
+		t.Errorf("Port expected 8080, got %d", cfg.Port)
+	}
+	if cfg.PingTimeout != 500*time.Millisecond {
+		t.Errorf("PingTimeout expected 500ms, got %v", cfg.PingTimeout)
 	}
 }

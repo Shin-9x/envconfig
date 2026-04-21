@@ -200,8 +200,16 @@ func setFieldValue(field reflect.Value, value, path, envKey, sep, kvSep, validat
 		}
 	}
 
-	switch field.Kind() {
+	if field.Type() == typeDuration {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("%s: invalid duration for %s: %w", path, envKey, err)
+		}
+		field.SetInt(int64(parsed))
+		return nil
+	}
 
+	switch field.Kind() {
 	case reflect.String:
 		field.SetString(value)
 
