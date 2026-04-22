@@ -23,16 +23,18 @@ const (
 
 var regexCache sync.Map
 
-// validateFieldValue runs all validation checks on a field after it has been set.
+// validateFieldValue runs all validation checks on field after it has been set.
 // It evaluates, in order:
-//  1. The Validator interface (custom logic on the type itself).
-//  2. Built-in rules declared in the `validate` struct tag.
-func validateFieldValue(field reflect.Value, value string, path string, envKey string, validateSpec string) error {
+//  1. The [Validator] interface, if implemented by the field's type.
+//  2. Built-in rules declared in the validate struct tag.
+//
+// A nil pointer field is skipped without error.
+func validateFieldValue(field reflect.Value, value, path, envKey, validateSpec string) error {
 	if field.Kind() == reflect.Pointer && field.IsNil() {
 		return nil
 	}
 
-	// 1. Custom Validator interface
+	// Custom Validator interface
 	if field.CanAddr() {
 		if v, ok := field.Addr().Interface().(Validator); ok {
 			if err := v.ValidateEnv(); err != nil {
@@ -49,7 +51,7 @@ func validateFieldValue(field reflect.Value, value string, path string, envKey s
 		}
 	}
 
-	// 2. Built-in tag-based rules
+	// Built-in tag-based rules
 	if validateSpec == emptyVal {
 		return nil
 	}
@@ -57,19 +59,20 @@ func validateFieldValue(field reflect.Value, value string, path string, envKey s
 	return applyBuiltinRules(field, value, path, envKey, validateSpec)
 }
 
-// applyBuiltinRules parses and applies the `validate` tag rules.
+// applyBuiltinRules parses and applies the rules declared in the validate struct tag.
 //
-// Supported syntax (rules are comma-separated):
+// Rules are comma-separated key=value pairs. The following rules are supported:
 //
-//	validate:"min=0"              numeric lower bound (inclusive)
-//	validate:"max=100"            numeric upper bound (inclusive)
-//	validate:"min=0,max=100"      combined range
-//	validate:"oneof=a|b|c"        value must be one of the pipe-separated options
-//	validate:"regex=^[a-z]+$"     value must match the regular expression
-//	validate:"len=8"              exact string/slice length
-//	validate:"minlen=2"           minimum string/slice length
-//	validate:"maxlen=64"          maximum string/slice length
-func applyBuiltinRules(field reflect.Value, rawValue string, path string, envKey string, spec string) error {
+//	min=N        numeric lower bound (inclusive); applies to int, uint, and float fields
+//	max=N        numeric upper bound (inclusive); applies to int, uint, and float fields
+//	oneof=a|b|c  the raw string value must match one of the pipe-separated options
+//	regex=RE     the raw string value must match the regular expression RE
+//	len=N        exact length; applies to string, slice, and map fields
+//	minlen=N     minimum length; applies to string, slice, and map fields
+//	maxlen=N     maximum length; applies to string, slice, and map fields
+//
+// Compiled regular expressions are cached for the lifetime of the process.
+func applyBuiltinRules(field reflect.Value, rawValue, path, envKey, spec string) error {
 	rules, err := parseValidateSpec(spec)
 	if err != nil {
 		return fmt.Errorf("%s: malformed validate tag for %s: %w", path, envKey, err)
@@ -113,9 +116,10 @@ func applyBuiltinRules(field reflect.Value, rawValue string, path string, envKey
 	return nil
 }
 
-// parseValidateSpec parses "min=0,max=100,oneof=a|b|c" into a map.
-// The regex rule is tricky: its value may contain commas (e.g. [a,b]+).
-// We therefore split only on commas that are followed by a known rule prefix.
+// parseValidateSpec parses a validate tag value into a rule-to-parameter map.
+//
+// Splitting is done on commas that are immediately followed by a known rule
+// prefix, so that commas inside a regex pattern (e.g. [a,b]+) are preserved.
 func parseValidateSpec(spec string) (map[string]string, error) {
 	rules := make(map[string]string)
 
@@ -141,8 +145,8 @@ func parseValidateSpec(spec string) (map[string]string, error) {
 	return rules, nil
 }
 
-// splitOnRuleBoundaries splits s on commas that are immediately followed by
-// one of the known prefixes. This preserves commas inside regex patterns.
+// splitOnRuleBoundaries splits s on commas that are immediately followed by one
+// of the provided prefixes, leaving all other commas intact.
 func splitOnRuleBoundaries(s string, prefixes []string) []string {
 	var parts []string
 	start := 0
@@ -163,8 +167,9 @@ func splitOnRuleBoundaries(s string, prefixes []string) []string {
 	return parts
 }
 
-// checkNumericBound validates min/max constraints for numeric kinds.
-func checkNumericBound(field reflect.Value, param string, path string, envKey string, rule string) error {
+// checkNumericBound enforces a min or max constraint on a numeric field.
+// It supports signed integers, unsigned integers, and floating-point kinds.
+func checkNumericBound(field reflect.Value, param, path, envKey, rule string) error {
 	kind := field.Kind()
 
 	switch {
@@ -173,48 +178,42 @@ func checkNumericBound(field reflect.Value, param string, path string, envKey st
 		if err != nil {
 			return fmt.Errorf("%s: invalid %s value %q for %s: %w", path, rule, param, envKey, err)
 		}
-		v := field.Int()
-		if rule == ruleMin && v < bound {
-			return fmt.Errorf("%s: value %d is less than min=%d for %s", path, v, bound, envKey)
-		}
-		if rule == ruleMax && v > bound {
-			return fmt.Errorf("%s: value %d exceeds max=%d for %s", path, v, bound, envKey)
-		}
+		return evaluateNumericRule(field.Int(), bound, rule, path, envKey)
 
 	case isUintKind(kind):
 		bound, err := strconv.ParseUint(param, 10, 64)
 		if err != nil {
 			return fmt.Errorf("%s: invalid %s value %q for %s: %w", path, rule, param, envKey, err)
 		}
-		v := field.Uint()
-		if rule == ruleMin && v < bound {
-			return fmt.Errorf("%s: value %d is less than min=%d for %s", path, v, bound, envKey)
-		}
-		if rule == ruleMax && v > bound {
-			return fmt.Errorf("%s: value %d exceeds max=%d for %s", path, v, bound, envKey)
-		}
+		return evaluateNumericRule(field.Uint(), bound, rule, path, envKey)
 
 	case isFloatKind(kind):
 		bound, err := strconv.ParseFloat(param, 64)
 		if err != nil {
 			return fmt.Errorf("%s: invalid %s value %q for %s: %w", path, rule, param, envKey, err)
 		}
-		v := field.Float()
-		if rule == ruleMin && v < bound {
-			return fmt.Errorf("%s: value %g is less than min=%g for %s", path, v, bound, envKey)
-		}
-		if rule == ruleMax && v > bound {
-			return fmt.Errorf("%s: value %g exceeds max=%g for %s", path, v, bound, envKey)
-		}
+		return evaluateNumericRule(field.Float(), bound, rule, path, envKey)
 
 	default:
 		return fmt.Errorf("%s: min/max rules are not applicable to type %s for %s", path, field.Type(), envKey)
 	}
+}
 
+// evaluateNumericRule applies a min or max bound check to a numeric value.
+// T is constrained to the three numeric kinds used internally: int64, uint64,
+// and float64.
+func evaluateNumericRule[T int64 | uint64 | float64](v, bound T, rule, path, envKey string) error {
+	if rule == ruleMin && v < bound {
+		return fmt.Errorf("%s: value %v is less than min=%v for %s", path, v, bound, envKey)
+	}
+	if rule == ruleMax && v > bound {
+		return fmt.Errorf("%s: value %v exceeds max=%v for %s", path, v, bound, envKey)
+	}
 	return nil
 }
 
-// checkOneOf validates that rawValue is one of the pipe-separated options.
+// checkOneOf returns an error if rawValue is not present in the pipe-separated
+// list of allowed options given by param.
 func checkOneOf(rawValue string, param string, path string, envKey string) error {
 	options := strings.Split(param, "|")
 	for _, opt := range options {
@@ -225,7 +224,9 @@ func checkOneOf(rawValue string, param string, path string, envKey string) error
 	return fmt.Errorf("%s: value %q is not one of [%s] for %s", path, rawValue, strings.Join(options, ", "), envKey)
 }
 
-// checkRegex validates that rawValue matches the given regular expression.
+// checkRegex returns an error if rawValue does not match the compiled form of
+// pattern. Compiled expressions are stored in regexCache to avoid recompilation
+// on repeated calls with the same pattern.
 func checkRegex(rawValue string, pattern string, path string, envKey string) error {
 	if cached, ok := regexCache.Load(pattern); ok {
 		re := cached.(*regexp.Regexp)
@@ -249,8 +250,9 @@ func checkRegex(rawValue string, pattern string, path string, envKey string) err
 	return nil
 }
 
-// checkLength validates exact, minimum, and maximum length for strings and slices.
-func checkLength(field reflect.Value, param string, path string, envKey string, rule string) error {
+// checkLength enforces len, minlen, and maxlen constraints on string, slice, and map fields.
+// For strings the byte length is used; for slices and maps the element count is used.
+func checkLength(field reflect.Value, param, path, envKey, rule string) error {
 	bound, err := strconv.Atoi(param)
 	if err != nil {
 		return fmt.Errorf("%s: invalid %s value %q for %s: %w", path, rule, param, envKey, err)
@@ -292,14 +294,17 @@ func checkLength(field reflect.Value, param string, path string, envKey string, 
 
 // ---------------------- KIND HELPERS ----------------------
 
+// isIntKind reports whether k is a signed integer kind.
 func isIntKind(k reflect.Kind) bool {
 	return k == reflect.Int || k == reflect.Int8 || k == reflect.Int16 || k == reflect.Int32 || k == reflect.Int64
 }
 
+// isUintKind reports whether k is an unsigned integer kind.
 func isUintKind(k reflect.Kind) bool {
 	return k == reflect.Uint || k == reflect.Uint8 || k == reflect.Uint16 || k == reflect.Uint32 || k == reflect.Uint64
 }
 
+// isFloatKind reports whether k is a floating-point kind.
 func isFloatKind(k reflect.Kind) bool {
 	return k == reflect.Float32 || k == reflect.Float64
 }

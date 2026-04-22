@@ -1,3 +1,9 @@
+// Package envconfig provides a generic, reflection-based loader for populating
+// configuration structs from environment variables.
+//
+// The entry point is [Load], which reads struct field tags to determine which
+// environment variables to look up, how to parse them, and how to validate the
+// resulting values.
 package envconfig
 
 import (
@@ -34,6 +40,17 @@ var (
 	typeTime     = reflect.TypeOf(time.Time{})
 )
 
+// Load reads environment variables into a new value of type T and returns it.
+// T must be a struct type; any other kind causes an immediate error.
+//
+// Field mapping is controlled entirely by struct tags (see package-level tag
+// constants). Nested structs are traversed recursively. Fields that implement
+// [Unmarshaler] or [encoding.TextUnmarshaler] are delegated to their own
+// unmarshalling logic.
+//
+// All field errors are collected and returned together as a single joined error,
+// so callers receive a complete picture of every misconfigured variable in one
+// pass.
 func Load[T any]() (T, error) {
 	var cfg T
 
@@ -52,6 +69,14 @@ func Load[T any]() (T, error) {
 
 // ---------------------- CORE ----------------------
 
+// processStruct iterates over the exported fields of v, resolving each field's
+// environment variable according to the tags present on the field.
+//
+// prefix is prepended to every env key resolved within this struct; path is a
+// dot-separated string used solely for human-readable error messages.
+//
+// Nested structs (excluding time.Duration, time.Time, and types that implement
+// a recognized unmarshalling interface) are processed recursively.
 func processStruct(v reflect.Value, prefix string, path string) error {
 	t := v.Type()
 	var errs []error
@@ -148,6 +173,14 @@ func processStruct(v reflect.Value, prefix string, path string) error {
 
 // ---------------------- VALUE SETTERS ----------------------
 
+// setFieldValue writes value into field, dispatching on the field's kind.
+//
+// Pointer fields are allocated on demand; an empty value leaves a nil pointer
+// rather than a pointer to a zero value. Slices and maps are handled by their
+// dedicated helpers. Fields that implement [Unmarshaler] or
+// [encoding.TextUnmarshaler] are delegated to those interfaces before any
+// kind-based switch is reached. time.Duration is treated as a special case and
+// parsed with [time.ParseDuration].
 func setFieldValue(field reflect.Value, value, path, envKey, sep, kvSep, validateSpec string) error {
 	// Handle pointer types: allocate, recurse on the pointed-to value, then assign.
 	if field.Kind() == reflect.Pointer {
@@ -262,6 +295,11 @@ func setFieldValue(field reflect.Value, value, path, envKey, sep, kvSep, validat
 	return nil
 }
 
+// setSliceValue splits value on sep and populates field with the resulting
+// elements. Each element is parsed through [setFieldValue] and then validated.
+// An empty value sets field to a nil slice rather than a single-element slice
+// containing an empty string. Errors from individual elements are collected and
+// returned together.
 func setSliceValue(field reflect.Value, value, path, envKey, sep, kvSep, validateSpec string) error {
 	// An empty value produces a nil slice, not [""]
 	if value == emptyVal {
@@ -303,6 +341,10 @@ func setSliceValue(field reflect.Value, value, path, envKey, sep, kvSep, validat
 	return nil
 }
 
+// setMapValue splits value on sep, then splits each token on kvSep to obtain
+// key-value pairs, and populates field accordingly. Only string map keys are
+// supported. An empty value initializes field to an empty (non-nil) map.
+// Errors from individual entries are collected and returned together.
 func setMapValue(field reflect.Value, value, path, envKey, sep, kvSep, validateSpec string) error {
 	// An empty value produces an empty map
 	if value == emptyVal {
@@ -361,6 +403,8 @@ func setMapValue(field reflect.Value, value, path, envKey, sep, kvSep, validateS
 
 // ---------------------- UTILS ----------------------
 
+// joinPath returns a dot-separated path string for use in error messages.
+// If parent is empty, child is returned unchanged.
 func joinPath(parent, child string) string {
 	if parent == "" {
 		return child

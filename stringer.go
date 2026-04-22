@@ -12,8 +12,13 @@ const comma = ","
 const space = " "
 const commaAndSpace = comma + space
 
-// Mask returns a string representation of any struct,
-// masking fields tagged as sensitive:"true".
+// Mask returns a human-readable representation of v, which must be a struct or
+// a pointer to a struct. Fields tagged with sensitive:"true" are replaced with
+// a fixed placeholder instead of their actual value, making the output safe for
+// logging and diagnostics.
+//
+// Nil pointers are rendered as "<nil>". Values that are not structs or struct
+// pointers fall back to the default fmt formatting.
 func Mask(v any) string {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() == reflect.Pointer {
@@ -34,6 +39,14 @@ func Mask(v any) string {
 
 // ---------------------- CORE ----------------------
 
+// maskStruct formats the exported fields of v into a flat slice of "KEY=value"
+// strings, recursing into nested structs. prefix is prepended to every env key
+// resolved within this struct; path is a dot-separated string used for
+// traversal bookkeeping.
+//
+// Fields that implement [encoding.TextMarshaler] are treated as scalar values
+// rather than recursed into. Sensitive fields are replaced with the masked
+// placeholder unless they are zero, in which case an empty string is used.
 func maskStruct(v reflect.Value, prefix string, path string) []string {
 	t := v.Type()
 	var parts []string
@@ -107,6 +120,15 @@ func maskStruct(v reflect.Value, prefix string, path string) []string {
 
 // ---------------------- VALUE FORMAT ----------------------
 
+// formatValue returns a string representation of v suitable for display.
+//
+// The resolution order is:
+//  1. [encoding.TextMarshaler] on the value or its address.
+//  2. Kind-specific formatting: slices render as "[a,b,c]", maps as
+//     "map[k1:v1, k2:v2]" with keys sorted lexicographically.
+//  3. Default fmt formatting for all other kinds.
+//
+// A nil pointer is rendered as "<nil>" without dereferencing.
 func formatValue(v reflect.Value) string {
 	// Safe handling of nil pointers to avoid interface panics
 	if v.Kind() == reflect.Pointer && v.IsNil() {
